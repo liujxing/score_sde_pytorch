@@ -78,7 +78,8 @@ def get_corrector(name):
 
 
 def get_sampling_fn(config, sde, shape, inverse_scaler, eps):
-  """Create a sampling function.
+  """
+  Create a sampling function. It could be either ODE sampling or predictor-corrector sampling.
 
   Args:
     config: A `ml_collections.ConfigDict` object that contains all configuration information.
@@ -195,8 +196,8 @@ class ReverseDiffusionPredictor(Predictor):
   def update_fn(self, x, t):
     f, G = self.rsde.discretize(x, t)
     z = torch.randn_like(x)
-    x_mean = x - f
-    x = x_mean + G[:, None, None, None] * z
+    x_mean = x - f  # remove the drift term because move forward in time
+    x = x_mean + G[:, None, None, None] * z  # add the diffusion term
     return x, x_mean
 
 
@@ -432,19 +433,27 @@ def get_ode_sampler(sde, shape, inverse_scaler,
     A sampling function that returns samples and the number of function evaluations during sampling.
   """
 
-  def denoise_update_fn(model, x):
+  def denoise_update_fn(model, x):  # run one additional denoising step
     score_fn = get_score_fn(sde, model, train=False, continuous=True)
     # Reverse diffusion predictor for denoising
     predictor_obj = ReverseDiffusionPredictor(sde, score_fn, probability_flow=False)
-    vec_eps = torch.ones(x.shape[0], device=x.device) * eps
+    vec_eps = torch.ones(x.shape[0], device=x.device) * eps  # a vector of epsilon since we only call denoising at epsilon time
     _, x = predictor_obj.update_fn(x, vec_eps)
     return x
 
   def drift_fn(model, x, t):
-    """Get the drift function of the reverse-time SDE."""
+    """
+    Get the drift function of the reverse-time SDE.
+    The ODE is expressed as dx = [f(x, t) - 0.5 g(t)**2 \nabla_x log p_t(x)] dt,
+    hence the drift term is f(x, t) - 0.5 g(t)**2 \nabla_x log p_t(x).
+    Here the \nabla_x log p_t(x) is approximated using the score_fn, and
+    g(t) is the stddev of noise as in dx = f(x, t) x dt + g(t) dw.
+    All the above is obtained by generating a reverse SDE/ODE class by sde.reverse, then
+    get rsde.sde
+    """
     score_fn = get_score_fn(sde, model, train=False, continuous=True)
-    rsde = sde.reverse(score_fn, probability_flow=True)
-    return rsde.sde(x, t)[0]
+    rsde = sde.reverse(score_fn, probability_flow=True)  # generate reverse SDE. By setting probability_flow=True, we get the reverse ODE.
+    return rsde.sde(x, t)[0]  # the drift term
 
   def ode_sampler(model, z=None):
     """The probability flow ODE sampler with black-box ODE solver.
@@ -464,19 +473,21 @@ def get_ode_sampler(sde, shape, inverse_scaler,
         x = z
 
       def ode_func(t, x):
-        x = from_flattened_numpy(x, shape).to(device).type(torch.float32)
-        vec_t = torch.ones(shape[0], device=x.device) * t
-        drift = drift_fn(model, x, vec_t)
+        x = from_flattened_numpy(x, shape).to(device).type(torch.float32)  # flatten initial value
+        vec_t = torch.ones(shape[0], device=x.device) * t  # vector of t
+        drift = drift_fn(model, x, vec_t)  # get drift under current x and t
         return to_flattened_numpy(drift)
 
       # Black-box ODE solver for the probability flow ODE
+      # Here ode_func gives the drift of current (x, t), (sde.T, eps) is the range of t to solve,
+      # to_flatten_numpy(x) is the initial value of x at sde.T
       solution = integrate.solve_ivp(ode_func, (sde.T, eps), to_flattened_numpy(x),
                                      rtol=rtol, atol=atol, method=method)
-      nfe = solution.nfev
-      x = torch.tensor(solution.y[:, -1]).reshape(shape).to(device).type(torch.float32)
+      nfe = solution.nfev  # number of evaluations
+      x = torch.tensor(solution.y[:, -1]).reshape(shape).to(device).type(torch.float32)  # reshape x to images
 
       # Denoising is equivalent to running one predictor step without adding noise
-      if denoise:
+      if denoise:  # running one more step of denoising since we are currently up to epsilon
         x = denoise_update_fn(model, x)
 
       x = inverse_scaler(x)

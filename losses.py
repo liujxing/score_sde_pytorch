@@ -80,17 +80,28 @@ def get_sde_loss_fn(sde, train, reduce_mean=True, continuous=True, likelihood_we
     Returns:
       loss: A scalar that represents the average loss value across the mini-batch.
     """
+    # score_fn is gradient of log p(x_t | x_0) with respect to x_t.
+    # here the output of score_fn has sign flipped and is normalized by stddev of noise.
     score_fn = mutils.get_score_fn(sde, model, train=train, continuous=continuous)
-    t = torch.rand(batch.shape[0], device=batch.device) * (sde.T - eps) + eps
-    z = torch.randn_like(batch)
-    mean, std = sde.marginal_prob(batch, t)
-    perturbed_data = mean + std[:, None, None, None] * z
-    score = score_fn(perturbed_data, t)
+    t = torch.rand(batch.shape[0], device=batch.device) * (sde.T - eps) + eps  # randomly sample t from 0 to T
+    z = torch.randn_like(batch)  # randomly sample standard normal noise
+    mean, std = sde.marginal_prob(batch, t)  # calculate mean and std of q(x_t | x_0)
+    perturbed_data = mean + std[:, None, None, None] * z  # construct an example of x_t from q(x_t | x_0). Since we have a batch of x_0, this is equivalent to sampling from marginal distribution p(x_t)
+    score = score_fn(perturbed_data, t)  # gradient of log p(perturbed_data | batch) with respect to p(perturbed_data)
 
+    # todo: the scale of score is not clear: is it normalized by std or nor?
     if not likelihood_weighting:
+      # here the sign is plus because the score sign is reverted in get_score_fn
+      # the normalizing by std of noise is undone here
+      # here z is the N(0, 1) noise, hence we only predict the direction of noise, and does not
+      # predict the scale of the noise because the scale is known from t
       losses = torch.square(score * std[:, None, None, None] + z)
-      losses = reduce_op(losses.reshape(losses.shape[0], -1), dim=-1)
+      losses = reduce_op(losses.reshape(losses.shape[0], -1), dim=-1)  # reduce on the pixel dimension, the shape is (batch, num_pixels_per_image)
     else:
+      # g2 is the noise stddev in the continuous SDE squared.
+      # g2 is used as weight of loss function to emphasize the more difficult tasks
+      # for VP, g2 is simply beta(t)
+      # here the zero_like(batch) is used as input because we only care about the diffusion term which is independent of x
       g2 = sde.sde(torch.zeros_like(batch), t)[1] ** 2
       losses = torch.square(score + z / std[:, None, None, None])
       losses = reduce_op(losses.reshape(losses.shape[0], -1), dim=-1) * g2
@@ -126,7 +137,11 @@ def get_smld_loss_fn(vesde, train, reduce_mean=False):
 
 
 def get_ddpm_loss_fn(vpsde, train, reduce_mean=True):
-  """Legacy code to reproduce previous results on DDPM. Not recommended for new work."""
+  """
+  Legacy code to reproduce previous results on DDPM. Not recommended for new work.
+
+  The code is similar to using VP for sde argument in get_sde_loss_fn function.
+  """
   assert isinstance(vpsde, VPSDE), "DDPM training only works for VPSDEs."
 
   reduce_op = torch.mean if reduce_mean else lambda *args, **kwargs: 0.5 * torch.sum(*args, **kwargs)
@@ -149,7 +164,13 @@ def get_ddpm_loss_fn(vpsde, train, reduce_mean=True):
 
 
 def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True, likelihood_weighting=False):
-  """Create a one-step training/evaluation function.
+  """
+  Create a one-step training/evaluation function.
+
+  This function works in the following way:
+  1. Create loss_fn that takes in model and a batch of data, and outputs the average loss of the batch
+  2. The loss_fn created in step 1 is used in defining a step_fn, which simply zero gradient,
+  perform one gradient step, and update states
 
   Args:
     sde: An `sde_lib.SDE` object that represents the forward SDE.
@@ -163,9 +184,13 @@ def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True
     A one-step function for training or evaluation.
   """
   if continuous:
+    # the loss function takes in model and batch of data, and outputs the average loss of the batch
     loss_fn = get_sde_loss_fn(sde, train, reduce_mean=reduce_mean,
                               continuous=True, likelihood_weighting=likelihood_weighting)
   else:
+    # the functions get_smld_loss_fn and get_ddpm_loss_fn should produce similar result as
+    # get_sde_loss_fn using VPSDE and VESDE, except when adding noise, instead of using
+    # continuous time t, they use discrete steps N.
     assert not likelihood_weighting, "Likelihood weighting is not supported for original SMLD/DDPM training."
     if isinstance(sde, VESDE):
       loss_fn = get_smld_loss_fn(sde, train, reduce_mean=reduce_mean)
@@ -176,6 +201,9 @@ def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True
 
   def step_fn(state, batch):
     """Running one step of training or evaluation.
+
+    For training, it simply zeros gradient, perform one gradient step on the model, update the EMA model.
+    For evaluation, without any gradient, it gets the EMA model and evaluate the loss on the batch data.
 
     This function will undergo `jax.lax.scan` so that multiple steps can be pmapped and jit-compiled together
     for faster execution.

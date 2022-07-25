@@ -44,6 +44,51 @@ from utils import save_checkpoint, restore_checkpoint
 FLAGS = flags.FLAGS
 
 
+"""
+flow of the program:
+train function:
+  1. The score_model, ema, and optimizer and are created and stored into states by
+  score_model = mutils.create_model(config)
+  ema = ExponentialMovingAverage(score_model.parameters(), decay=config.model.ema_rate)
+  optimizer = losses.get_optimizer(config, score_model.parameters())
+  state = dict(optimizer=optimizer, model=score_model, ema=ema, step=0)   
+  
+  2. The sde is created by 
+  sde = sde_lib.VPSDE(beta_min=config.model.beta_min, beta_max=config.model.beta_max, N=config.model.num_scales)
+  
+  3. The train step function is created from sde and optimize function by  
+  optimize_fn = losses.optimization_manager(config)
+  train_step_fn = losses.get_step_fn(sde, train=True, optimize_fn=optimize_fn,
+                                     reduce_mean=reduce_mean, continuous=continuous,
+                                     likelihood_weighting=likelihood_weighting)
+                                     
+  4. For each batch of data, a single step of the gradient descent on current state is performed by 
+  loss = train_step_fn(state, batch)
+  
+evaluation function:
+  1. Similar to above, it creates score_model, state and sde
+  
+  2. Create evaluation function by 
+  eval_step = losses.get_step_fn(sde, train=False, optimize_fn=optimize_fn,
+                                   reduce_mean=reduce_mean,
+                                   continuous=continuous,
+                                   likelihood_weighting=likelihood_weighting)
+                                   
+  3. The evaluation loss on a batch of data is calculated by 
+  eval_loss = eval_step(state, eval_batch)
+                                   
+  4. The likelihood is estimated by 
+  likelihood_fn = likelihood.get_likelihood_fn(sde, inverse_scaler)
+  
+  5. The sampling function is created by 
+  sampling_fn = sampling.get_sampling_fn(config, sde, sampling_shape, inverse_scaler, sampling_eps)
+  
+  6. The samples are created by 
+  sample, n = sampling_fn(score_model) 
+
+"""
+
+
 def train(config, workdir):
   """Runs the training pipeline.
 

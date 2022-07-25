@@ -24,6 +24,17 @@ import numpy as np
 _MODELS = {}
 
 
+"""
+The whole module works in the following way:
+
+1. The register_model decorator is defined in utils.py. 
+2. In other files, the models are defined with @utils.register_model(name='model_name') on top, 
+then these models will be registered under _MODELS in utils.py, and can be retrieved by 
+utils.create_model(model_name) 
+
+"""
+
+
 def register_model(cls=None, *, name=None):
   """A decorator for registering model classes."""
 
@@ -127,7 +138,21 @@ def get_model_fn(model, train=False):
 
 
 def get_score_fn(sde, model, train=False, continuous=False):
-  """Wraps `score_fn` so that the model output corresponds to a real time-dependent score function.
+  """
+  Wraps `score_fn` so that the model output corresponds to a real time-dependent score function.
+
+  The score function takes a batch of (x, t) and returns the score with the same shape of x.
+
+  Here the score function is $\nabla_{x_t} log p(x_t | x_0)$. In reality, we would like to calculate
+  $\nabla_{x_t} log p(x_t)$, i.e. gradient of marginal distribution instead of conditional distribution.
+  However, as shown in equation (2) of "Generative Modeling by Estimating Gradients of Data Distribution",
+  the gradient of marginal distribution can be estimated from the gradient of conditional distribution,
+  and only the gradient of conditional distribution is practical to estimate since the process of
+  adding gradient is the choice of user, hence the gradient of conditional distribution is used.
+
+  The interpretation of the score function is: given a smeared image, and given the process that
+  generates this image from raw image, the score is estimation of the noise added to each pixel of
+  the smeared image.
 
   Args:
     sde: An `sde_lib.SDE` object that represents the forward SDE.
@@ -152,11 +177,13 @@ def get_score_fn(sde, model, train=False, continuous=False):
         std = sde.marginal_prob(torch.zeros_like(x), t)[1]
       else:
         # For VP-trained models, t=0 corresponds to the lowest noise level
+        # N is discretization steps. This converts continuous time t to discrete steps n
+        # For VP model, t in range [0, 1], hence labels in range [0, N - 1]
         labels = t * (sde.N - 1)
-        score = model_fn(x, labels)
-        std = sde.sqrt_1m_alphas_cumprod.to(labels.device)[labels.long()]
+        score = model_fn(x, labels)  # calculate score as output of model, where score is nabla_{x_t} log p(x_t | x_0)
+        std = sde.sqrt_1m_alphas_cumprod.to(labels.device)[labels.long()]  # std of stddev of log p(x_t | x_0). If Gaussian noise is added, then it is the stddev of the noise to get x_t from x_0
 
-      score = -score / std[:, None, None, None]
+      score = -score / std[:, None, None, None]  # flip sign of score, and normalize by stddev of noise
       return score
 
   elif isinstance(sde, sde_lib.VESDE):

@@ -24,22 +24,32 @@ from models import utils as mutils
 
 
 def get_div_fn(fn):
-  """Create the divergence function of `fn` using the Hutchinson-Skilling trace estimator."""
+  """
+  Create the divergence function of `fn` using the Hutchinson-Skilling trace estimator.
+  """
 
   def div_fn(x, t, eps):
+    # here eps is the epsilon in equation (40)
+    # here x requires gradient because we need to calculate the gradient of f with respect to x
+    # we need to calculate eps.T @ \nabla fn @ eps, which is
+    # \sum_{ij} eps_i \frac{\partial fn_j}{\partial x_i} eps_j = \sum_i (eps_i M_i)
+    # where M_i = \sum_j \frac{\partial fn_j}{\partial x_i} eps_j, hence we can get M_j by
+    # torch.sum(fn(x, t) * eps), taking gradient with respect to x as grad_fn_eps, then
+    # get result = torch.sum(grad_fn_eps * eps)
     with torch.enable_grad():
       x.requires_grad_(True)
-      fn_eps = torch.sum(fn(x, t) * eps)
-      grad_fn_eps = torch.autograd.grad(fn_eps, x)[0]
-    x.requires_grad_(False)
-    return torch.sum(grad_fn_eps * eps, dim=tuple(range(1, len(x.shape))))
+      fn_eps = torch.sum(fn(x, t) * eps)  # the sum is across both the pixels and batch, and this is OK because the gradient on pixel of one image does not affect the other images
+      grad_fn_eps = torch.autograd.grad(fn_eps, x)[0]  # has shape (batch_size, image_size)
+    x.requires_grad_(False)  # remove gradient calculation
+    return torch.sum(grad_fn_eps * eps, dim=tuple(range(1, len(x.shape))))  # perform sum over all dimensions except the first one which is the batch dimension
 
   return div_fn
 
 
 def get_likelihood_fn(sde, inverse_scaler, hutchinson_type='Rademacher',
                       rtol=1e-5, atol=1e-5, method='RK45', eps=1e-5):
-  """Create a function to compute the unbiased log-likelihood estimate of a given data point.
+  """
+  Create a function to compute the unbiased log-likelihood estimate of a given data point.
 
   Args:
     sde: A `sde_lib.SDE` object that represents the forward SDE.
@@ -57,13 +67,24 @@ def get_likelihood_fn(sde, inverse_scaler, hutchinson_type='Rademacher',
   """
 
   def drift_fn(model, x, t):
-    """The drift function of the reverse-time SDE."""
+    """
+    The drift function of the reverse-time SDE.
+    It is the bar{f}(x, t) term in equation (38) in Score-Based Generative Modeling Through
+    Stochastic Differential Equations, i.e. the drift term in the ODE
+    """
     score_fn = mutils.get_score_fn(sde, model, train=False, continuous=True)
     # Probability flow ODE is a special case of Reverse SDE
-    rsde = sde.reverse(score_fn, probability_flow=True)
+    rsde = sde.reverse(score_fn, probability_flow=True)  # use probability_flow=True to get ODE
     return rsde.sde(x, t)[0]
 
   def div_fn(model, x, t, noise):
+    """
+    This function calculates the divergence (i.e. 'div' here) of drift term of ODE, i.e.
+    $\nabla \cdot \bar{f}(x, t)$ in equation (39)
+
+    The function gets the drift term using drift_fn, then call get_div_fn to get its divergence
+
+    """
     return get_div_fn(lambda xx, tt: drift_fn(model, xx, tt))(x, t, noise)
 
   def likelihood_fn(model, data):
@@ -81,9 +102,12 @@ def get_likelihood_fn(sde, inverse_scaler, hutchinson_type='Rademacher',
     """
     with torch.no_grad():
       shape = data.shape
+      # here epsilon is the epsilon in equation (40) which is used to estimate the divergence of Jacobian of bar{f}(x, t)
+      # epsilon satisfies the requirement with mean 0 and stddev of 1.
       if hutchinson_type == 'Gaussian':
-        epsilon = torch.randn_like(data)
+        epsilon = torch.randn_like(data)  # normal distribution satisfies mean 0 and scale 1
       elif hutchinson_type == 'Rademacher':
+        # discrete value of either 0 to 1 with equal probability, it is * 2 - 1 to get mean 0 and scale 1
         epsilon = torch.randint_like(data, low=0, high=2).float() * 2 - 1.
       else:
         raise NotImplementedError(f"Hutchinson type {hutchinson_type} unknown.")
@@ -91,18 +115,19 @@ def get_likelihood_fn(sde, inverse_scaler, hutchinson_type='Rademacher',
       def ode_func(t, x):
         sample = mutils.from_flattened_numpy(x[:-shape[0]], shape).to(data.device).type(torch.float32)
         vec_t = torch.ones(sample.shape[0], device=sample.device) * t
-        drift = mutils.to_flattened_numpy(drift_fn(model, sample, vec_t))
-        logp_grad = mutils.to_flattened_numpy(div_fn(model, sample, vec_t, epsilon))
+        drift = mutils.to_flattened_numpy(drift_fn(model, sample, vec_t))  # drift term of ODE
+        logp_grad = mutils.to_flattened_numpy(div_fn(model, sample, vec_t, epsilon))  # divergence of Jacobian, as in equation (40)
         return np.concatenate([drift, logp_grad], axis=0)
 
       init = np.concatenate([mutils.to_flattened_numpy(data), np.zeros((shape[0],))], axis=0)
+      # the solution to equation (40)
       solution = integrate.solve_ivp(ode_func, (eps, sde.T), init, rtol=rtol, atol=atol, method=method)
       nfe = solution.nfev
       zp = solution.y[:, -1]
       z = mutils.from_flattened_numpy(zp[:-shape[0]], shape).to(data.device).type(torch.float32)
-      delta_logp = mutils.from_flattened_numpy(zp[-shape[0]:], (shape[0],)).to(data.device).type(torch.float32)
-      prior_logp = sde.prior_logp(z)
-      bpd = -(prior_logp + delta_logp) / np.log(2)
+      delta_logp = mutils.from_flattened_numpy(zp[-shape[0]:], (shape[0],)).to(data.device).type(torch.float32)  # the integral term in equation (40)
+      prior_logp = sde.prior_logp(z)  # get prior of log p, i.e. log p(x_T)
+      bpd = -(prior_logp + delta_logp) / np.log(2)  # prior_logp + delta_logp is logp of data, then it is changed to log2 for calculating bps later
       N = np.prod(shape[1:])
       bpd = bpd / N
       # A hack to convert log-likelihoods to bits/dim

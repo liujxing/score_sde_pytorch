@@ -23,6 +23,14 @@ import logging
 import os
 import tensorflow as tf
 
+"""
+flow of the file:
+1. The flags are defined using absl.flags
+2. The running functions are defined in run_lib.py
+3. The running functions are called by absl.app.run()
+
+"""
+
 FLAGS = flags.FLAGS
 
 config_flags.DEFINE_config_file(

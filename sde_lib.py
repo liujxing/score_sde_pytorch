@@ -24,11 +24,20 @@ class SDE(abc.ABC):
 
   @abc.abstractmethod
   def sde(self, x, t):
+    """
+    returns the drift term f(x, t) and diffusion term g(t) from equation
+    dx = f(x, t)dt + g(t) dw
+    """
     pass
 
   @abc.abstractmethod
   def marginal_prob(self, x, t):
-    """Parameters to determine the marginal distribution of the SDE, $p_t(x)$."""
+    """
+    Parameters to determine the marginal distribution of the SDE, $p_t(x)$.
+    More accurately, it should be the conditional distribution p(x_t|x_0). Then when we sample
+    a batch of x_0 and for each sample in x_0 we get a sample from p(x_t|x_0), then we are sampling
+    in the marginal distribution p(x_t)
+    """
     pass
 
   @abc.abstractmethod
@@ -70,6 +79,8 @@ class SDE(abc.ABC):
 
   def reverse(self, score_fn, probability_flow=False):
     """Create the reverse-time SDE/ODE.
+    When probability_flow is set to True, this function generates the reverse ODE, otherwise it
+    generates the reverse SDE.
 
     Args:
       score_fn: A time-dependent score-based model that takes x and t and returns the score.
@@ -91,7 +102,14 @@ class SDE(abc.ABC):
         return T
 
       def sde(self, x, t):
-        """Create the drift and diffusion functions for the reverse SDE/ODE."""
+        """
+        Create the drift and diffusion functions for the reverse SDE/ODE.
+        The original SDE is dx = drift dt + diffusion dw,
+        and the reverse SDE is dx = (drift - diffusion**2 * score) dt + diffusion dw, this is calculated
+        by setting probability_flow to False,
+        and the ODE is dx = (drift - 0.5 * diffusion**2 * score) dt, this is calculated by setting
+        probability_flow = True
+        """
         drift, diffusion = sde_fn(x, t)
         score = score_fn(x, t)
         drift = drift - diffusion[:, None, None, None] ** 2 * score * (0.5 if self.probability_flow else 1.)
@@ -121,24 +139,40 @@ class VPSDE(SDE):
     super().__init__(N)
     self.beta_0 = beta_min
     self.beta_1 = beta_max
-    self.N = N
-    self.discrete_betas = torch.linspace(beta_min / N, beta_max / N, N)
-    self.alphas = 1. - self.discrete_betas
-    self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-    self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
-    self.sqrt_1m_alphas_cumprod = torch.sqrt(1. - self.alphas_cumprod)
+    self.N = N  # number of discrete steps
+    self.discrete_betas = torch.linspace(beta_min / N, beta_max / N, N)  # beta in discrete space
+    self.alphas = 1. - self.discrete_betas  # alpha = 1 - beta
+    self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)  # cumulative prod of alpha, equivalent to bar{\alpha} in DDPM paper
+    self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)  # sqrt(bar{alpha})
+    self.sqrt_1m_alphas_cumprod = torch.sqrt(1. - self.alphas_cumprod)  # sqrt(1 - bar{alpha}), this is the std of noise after n steps
 
   @property
   def T(self):
-    return 1
+    return 1  # T in range [0, 1]
 
   def sde(self, x, t):
-    beta_t = self.beta_0 + t * (self.beta_1 - self.beta_0)
+    """
+    returns the drift term f(x, t) and diffusion term g(t) from equation
+    dx = f(x, t)dt + g(t) dw
+    """
+    beta_t = self.beta_0 + t * (self.beta_1 - self.beta_0)  # linear change of beta with respect to T, T in [0, 1], beta in [beta_0, beta_1]
+
+    # for differential equation dx = -1/2 beta_t x dt + sqrt(beta_t) dw
     drift = -0.5 * beta_t[:, None, None, None] * x
     diffusion = torch.sqrt(beta_t)
     return drift, diffusion
 
   def marginal_prob(self, x, t):
+    """
+    This is the solution of SDE dx = -0.5 beta_t x dt + sqrt(beta_t) dw, the solution is
+    log_mean_coeff = -0.5 * \int_{t=0}^{t=T}(beta(t) dt),
+    x(t) = x(0) exp(log_mean_coeff) + z sqrt(1 - exp(2 * log_mean_coeff))
+    The expression of log_mean_coeff is the case when beta(t) = beta_0 + t * (beta_1 - beta_0).
+
+    This shows one advantage of using continuous time: we could analytically calculate the expression
+    of many types of q(x_t | x_0) analytically by stochastic calculus
+
+    """
     log_mean_coeff = -0.25 * t ** 2 * (self.beta_1 - self.beta_0) - 0.5 * t * self.beta_0
     mean = torch.exp(log_mean_coeff[:, None, None, None]) * x
     std = torch.sqrt(1. - torch.exp(2. * log_mean_coeff))
